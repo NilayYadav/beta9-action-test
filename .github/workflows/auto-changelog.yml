@@ -1,0 +1,270 @@
+name: Auto Changelog PR
+
+on:
+  release:
+    types: [published]
+
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the Beta9 repo
+        uses: actions/checkout@v3
+
+      - name: Fetch the latest release data
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            function formatDate(dateString) {
+              const date = new Date(dateString);
+              const month = String(date.getMonth() + 1).padStart(2, '0');
+              const day = String(date.getDate()).padStart(2, '0');
+              const year = String(date.getFullYear()).slice(-2);
+              return `${month}-${day}-${year}`;
+            }
+
+            function prettyDate(dateString) {
+              const date = new Date(dateString);
+
+              return new Intl.DateTimeFormat('en-US', {
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric',
+                timeZone: 'UTC',
+              }).format(date);
+            }
+
+            const release = context.payload.release;
+
+            // log the release object to help debug failed actions
+            console.log(release);
+
+            const lines = release.body.split('\n');
+
+            const feats = [];
+            const fixes = [];
+            for (const line of lines) {
+              if (line.startsWith('*')) {
+                const m = line.match(/^\*\s*([fF]eat|[fF]ix):\s*(.*)\s*/);
+                if (m) {
+                  const [_, type, description] = m;
+                  const byIndex = description.indexOf('by');
+                  
+                  if (type.toLowerCase() === 'feat') {
+                    const cleanedDesc = description.slice(0, byIndex).trim();
+                    feats.push(cleanedDesc);
+                  } else if (type.toLowerCase() === 'fix') {
+                    const cleanedDesc = description.slice(0, byIndex).trim();
+                    fixes.push(cleanedDesc);
+                  }
+                }
+              }
+            }
+
+            // Stop the workflow if no features or fixes are found
+            if (feats.length === 0 && fixes.length === 0) {
+              core.setOutput('should_continue', 'false');
+              core.setOutput('error_message', 'No features or fixes found in the release notes. Stopping workflow.');
+              return;
+            }
+
+            core.setOutput('name', release.tag_name);
+            core.setOutput('new_feats', JSON.stringify(feats));
+            core.setOutput('new_fixes', JSON.stringify(fixes));
+            core.setOutput('created_at', formatDate(release.created_at));
+            core.setOutput('pretty_date', prettyDate(release.created_at));
+            core.setOutput('should_continue', 'true');
+
+      - name: Checkout NilayYadav/test-docs repo
+        if: steps.release.outputs.should_continue == 'true'
+        uses: actions/checkout@v3
+        with:
+          repository: NilayYadav/test-docs
+          path: NilayYadav/test-docs
+          token: ${{ secrets.BEAM_DOCS_PAT }}
+
+      - name: Process changelog
+        if: steps.release.outputs.should_continue == 'true'
+        id: process_changelog
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const filename = `./NilayYadav/test-docs/v2/releases/${process.env.CREATED_AT}.mdx`;
+            let existingFeats = [];
+            let existingFixes = [];
+
+            if (fs.existsSync(filename)) {
+              const content = fs.readFileSync(filename, 'utf8');
+              const featuresMatch = content.match(/## Features\n([\s\S]*?)(?=\n## |$)/);
+              const fixesMatch = content.match(/## Fixes\n([\s\S]*?)(?=\n## |$)/);
+
+              if (featuresMatch) {
+                existingFeats = featuresMatch[1].split('\n').filter(line => line.trim().startsWith('-')).map(line => line.trim().slice(2));
+              }
+              if (fixesMatch) {
+                existingFixes = fixesMatch[1].split('\n').filter(line => line.trim().startsWith('-')).map(line => line.trim().slice(2));
+              }
+            }
+
+            const newFeats = JSON.parse(process.env.NEW_FEATS);
+            const newFixes = JSON.parse(process.env.NEW_FIXES);
+
+            const allFeats = [...new Set([...existingFeats, ...newFeats])];
+            const allFixes = [...new Set([...existingFixes, ...newFixes])];
+
+            const featsString = allFeats.map(feat => `- ${feat}`).join('\n');
+            const fixesString = allFixes.map(fix => `- ${fix}`).join('\n');
+
+            core.setOutput('feats', featsString);
+            core.setOutput('fixes', fixesString);
+        env:
+          CREATED_AT: ${{ steps.release.outputs.created_at }}
+          NEW_FEATS: ${{ steps.release.outputs.new_feats }}
+          NEW_FIXES: ${{ steps.release.outputs.new_fixes }}
+
+      - name: Enhance changelog with LLM
+        if: steps.release.outputs.should_continue == 'true'
+        id: enhance_changelog
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const systemPrompt = `You are a technical documentation specialist who transforms raw changelog entries into user-friendly, marketing-oriented release notes in the Mintlify format. 
+
+            Follow these rules:
+            1. Group related features into meaningful sections with descriptive headings
+            2. Enhance technical descriptions to highlight user benefits
+            3. Use consistent, friendly language
+            4. Format output using the <Update> component as shown in the Mintlify examples
+            5. Include appropriate spacing and formatting for readability
+            6. Categorize features under "Improvements" and fixes under "Bug fixes" sections
+            7. Add a compelling title that summarizes the major changes
+            8. Make the changelog accessible to non-technical users while preserving technical accuracy
+            9. Output in markdown format ready for inclusion in a Mintlify docs site`;
+
+            const userPrompt = `Transform these raw changelog entries into a well-formatted Mintlify changelog for ${process.env.PRETTY_DATE}:
+              
+            ## Features
+            ${process.env.FEATURES_SECTION}
+
+            ## Fixes
+            ${process.env.FIXES_SECTION}
+
+            Format the output using the Mintlify <Update> component structure like this:
+
+            ---
+            title: "Small Title of Major Change"
+            description: "Brief description of the major change or theme of this update"
+            ---
+
+            <Update label="Month Year">
+              ## Descriptive Title of Major Change
+
+              Brief description of the major change or theme of this update.
+
+              ## Improvements
+
+              * Enhanced feature 1 description
+              * Enhanced feature 2 description
+              
+              ## Bug fixes
+
+              * Enhanced fix 1 description
+              * Enhanced fix 2 description
+            </Update>`;
+
+            try {
+              const response = await fetch('https://api.together.xyz/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${process.env.TOGETHER_API_KEY}`
+                },
+                body: JSON.stringify({
+                  model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                  messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userPrompt }
+                  ],
+                  temperature: 0.7,
+                  max_tokens: 2000
+                })
+              });
+              
+              const data = await response.json();
+              
+              if (data.choices && data.choices[0].message.content) {
+                const enhancedContent = data.choices[0].message.content.trim();
+                core.setOutput('enhanced_content', enhancedContent);
+              } else {
+                throw new Error("Invalid response from OpenAI API");
+              }
+            } catch (error) {
+              console.error('Error calling OpenAI API:', error);
+              throw error;
+            }
+        env:
+          TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+          FEATURES_SECTION: ${{ steps.process_changelog.outputs.feats }}
+          FIXES_SECTION: ${{ steps.process_changelog.outputs.fixes }}
+          PRETTY_DATE: ${{ steps.release.outputs.pretty_date }}
+
+      - name: Create new release file in NilayYadav/test-docs
+        if: steps.release.outputs.should_continue == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const filename = `./NilayYadav/test-docs/v2/releases/${process.env.CREATED_AT}.mdx`;
+
+            if (fs.existsSync(filename)) {
+              fs.unlinkSync(filename);
+            }
+
+            fs.writeFileSync(filename, process.env.ENHANCED_CONTENT);
+            console.log(`Created changelog file: ${filename}`);
+        env:
+          CREATED_AT: ${{ steps.release.outputs.created_at }}
+          ENHANCED_CONTENT: ${{ steps.enhance_changelog.outputs.enhanced_content }}
+
+      - name: Update mint.json
+        if: steps.release.outputs.should_continue == 'true'
+        run: |
+          cd NilayYadav/test-docs
+          NEW_FILE="v2/releases/${{ steps.release.outputs.created_at }}"
+          jq --arg new_file "$NEW_FILE" '
+            .navigation.tabs[] |= 
+              if .tab == "Changelog" then 
+                .groups[] |= 
+                  if .group == "Changelog" then
+                    .pages |= if index($new_file) then . else [$new_file] + . end
+                  else
+                    .
+                  end
+              else 
+                .
+              end
+          ' ./docs.json > ./docs.json.tmp && mv ./docs.json.tmp ./docs.json
+
+      - name: Commit and push changes
+        if: steps.release.outputs.should_continue == 'true'
+        run: |
+          cd NilayYadav/test-docs
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git checkout -b autochangelog/${{ steps.release.outputs.name }}
+          git add .
+          git commit -m "Add changelog for ${{ steps.release.outputs.name }}"
+          git push -u origin autochangelog/${{ steps.release.outputs.name }}
+
+      - name: Create pull request
+        if: steps.release.outputs.should_continue == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BEAM_DOCS_PAT }}
+        run: |
+          cd NilayYadav/test-docs
+          gh pr create --title "Changelog for ${{ steps.release.outputs.name }}" --body "This PR adds the changelog for ${{ steps.release.outputs.name }}." --base main --head autochangelog/${{ steps.release.outputs.name }}
